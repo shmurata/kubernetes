@@ -162,7 +162,14 @@ func getVipByName(client *gophercloud.ServiceClient, name string) (*vips.Virtual
 		if err != nil {
 			return false, err
 		}
-		vipList = append(vipList, v...)
+		// filter by name
+		filterdVips := make([]vips.VirtualIP, 0, 1)
+		for _, vip := range v {
+			if vip.Name == name {
+				filterdVips = append(filterdVips, vip)
+			}
+		}
+		vipList = append(vipList, filterdVips...)
 		if len(vipList) > 1 {
 			return false, ErrMultipleResults
 		}
@@ -197,7 +204,15 @@ func getLoadbalancerByName(client *gophercloud.ServiceClient, name string) (*loa
 		if err != nil {
 			return false, err
 		}
-		loadbalancerList = append(loadbalancerList, v...)
+		// filter by name
+		filteredLoadBalancerList := make([]loadbalancers.LoadBalancer, 0, 1)
+		for _, lb := range v {
+			glog.V(2).Infof("getLoadbalancerByName List: %s", lb.Name)
+			if lb.Name == name {
+				filteredLoadBalancerList = append(filteredLoadBalancerList, lb)
+			}
+		}
+		loadbalancerList = append(loadbalancerList, filteredLoadBalancerList...)
 		if len(loadbalancerList) > 1 {
 			return false, ErrMultipleResults
 		}
@@ -326,6 +341,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(apiService *api.Service, hosts []string
 	// TODO: Implement a more efficient update strategy for common changes than delete & create
 	// In particular, if we implement hosts update, we can get rid of UpdateHosts
 	if exists {
+		glog.V(2).Infof("Delete already exists LB: %s", cloudprovider.GetLoadBalancerName(apiService))
 		err := lbaas.EnsureLoadBalancerDeleted(apiService)
 		if err != nil {
 			return nil, fmt.Errorf("error deleting existing openstack load balancer: %v", err)
@@ -349,8 +365,10 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(apiService *api.Service, hosts []string
 		createOpts.VipAddress = loadBalancerIP
 	}
 
+	glog.V(2).Infof("Create LB: %s", name)
 	loadbalancer, err := loadbalancers.Create(lbaas.network, createOpts).Extract()
 	if err != nil {
+		glog.V(2).Infof("Create LB ERROR: %s, %s", name, lbaas.opts.SubnetId)
 		// cleanup what was created so far
 		_ = lbaas.EnsureLoadBalancerDeleted(apiService)
 		return nil, err
@@ -551,6 +569,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 		return nil
 	}
 
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete floating ip", loadBalancerName)
 	if lbaas.opts.FloatingNetworkId != "" && loadbalancer != nil {
 		portID, err := getPortIDByIP(lbaas.network, loadbalancer.VipAddress)
 		if err != nil {
@@ -570,8 +589,10 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 	}
 
 	// get all listeners associated with this loadbalancer
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete listener", loadBalancerName)
 	var listenerIDs []string
-	err = listeners.List(lbaas.network, listeners.ListOpts{LoadbalancerID: loadbalancer.ID}).EachPage(func(page pagination.Page) (bool, error) {
+	// err = listeners.List(lbaas.network, listeners.ListOpts{LoadbalancerID: loadbalancer.ID}).EachPage(func(page pagination.Page) (bool, error) {
+	err = listeners.List(lbaas.network, listeners.ListOpts{Name: loadBalancerName}).EachPage(func(page pagination.Page) (bool, error) {
 		listenerList, err := listeners.ExtractListeners(page)
 		if err != nil {
 			return false, err
@@ -587,15 +608,18 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 		return err
 	}
 
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete pool", loadBalancerName)
 	// get all pools associated with this loadbalancer
 	var poolIDs []string
-	err = v2_pools.List(lbaas.network, v2_pools.ListOpts{LoadbalancerID: loadbalancer.ID}).EachPage(func(page pagination.Page) (bool, error) {
+	// err = v2_pools.List(lbaas.network, v2_pools.ListOpts{LoadbalancerID: loadbalancer.ID}).EachPage(func(page pagination.Page) (bool, error) {
+	err = v2_pools.List(lbaas.network, v2_pools.ListOpts{Name: loadBalancerName}).EachPage(func(page pagination.Page) (bool, error) {
 		poolsList, err := v2_pools.ExtractPools(page)
 		if err != nil {
 			return false, err
 		}
 
 		for _, pool := range poolsList {
+			glog.V(4).Infof("EnsureLoadBalancerDeleted get pool list %v", pool.ID)
 			poolIDs = append(poolIDs, pool.ID)
 		}
 
@@ -605,6 +629,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 		return err
 	}
 
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete members", loadBalancerName)
 	// get all members associated with each poolIDs
 	var memberIDs []string
 	for _, poolID := range poolIDs {
@@ -625,9 +650,11 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 		}
 	}
 
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete monitor", loadBalancerName)
 	// get all monitors associated with each poolIDs
 	var monitorIDs []string
 	for _, poolID := range poolIDs {
+		glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete monitor get monitor", poolID)
 		err = v2_monitors.List(lbaas.network, v2_monitors.ListOpts{PoolID: poolID}).EachPage(func(page pagination.Page) (bool, error) {
 			monitorsList, err := v2_monitors.ExtractMonitors(page)
 			if err != nil {
@@ -635,7 +662,8 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 			}
 
 			for _, monitor := range monitorsList {
-				monitorIDs = append(monitorIDs, monitor.ID)
+				glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete monitor get monitor %v", poolID, monitor.ID)
+				// monitorIDs = append(monitorIDs, monitor.ID)
 			}
 
 			return true, nil
@@ -647,6 +675,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 
 	// delete all monitors
 	for _, monitorID := range monitorIDs {
+		glog.V(4).Infof("EnsureLoadBalancerDeleted delete monitor get monitor %v", monitorID)
 		err := v2_monitors.Delete(lbaas.network, monitorID).ExtractErr()
 		if err != nil && !isNotFound(err) {
 			return err
@@ -682,6 +711,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(service *api.Service) error {
 		waitLoadbalancerActiveProvisioningStatus(lbaas.network, loadbalancer.ID)
 	}
 
+	glog.V(4).Infof("EnsureLoadBalancerDeleted(%v) delete lb", loadBalancerName)
 	// delete loadbalancer
 	err = loadbalancers.Delete(lbaas.network, loadbalancer.ID).ExtractErr()
 	if err != nil && !isNotFound(err) {
